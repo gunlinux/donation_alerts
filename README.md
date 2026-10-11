@@ -25,6 +25,13 @@ The OAuth **refresh token** and access-token expiry are kept in a separate
 secrets file `.tokens.json` (gitignored, written with mode `0600`), never in
 `.env`.
 
+Values in `.env` take precedence over variables already exported in the shell
+for the keys above, so a token written by `token`/`refresh` is always the one
+used by the next run. A key that `.env` does not define still falls back to the
+environment. Quote values that contain spaces (for example
+`SCOPES="oauth-user-show oauth-donation-subscribe"`): an unquoted multi-word
+value is a parse error, and the CLI stops with an error naming `.env`.
+
 ## Usage
 
 ```sh

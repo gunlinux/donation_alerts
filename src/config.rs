@@ -91,10 +91,22 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load the process environment, overlaying `.env` when it is present.
+    /// Load configuration from the default `.env` in the current directory.
     pub fn load() -> Result<Self> {
-        let env_path = PathBuf::from(".env");
-        let _ = dotenvy::from_filename(&env_path); // a missing .env is fine
+        Self::load_from(Path::new(".env"))
+    }
+
+    /// Load configuration, overlaying `env_path` on the process environment.
+    ///
+    /// A present-but-unparseable file is an error; a missing file is fine.
+    /// Values defined in the file win over variables already present in the
+    /// environment, so a token persisted by `token`/`refresh` is always the one
+    /// used; keys the file omits still fall back to the environment.
+    fn load_from(env_path: &Path) -> Result<Self> {
+        if env_path.exists() {
+            dotenvy::from_filename_override(env_path)
+                .with_context(|| format!("parsing {}", env_path.display()))?;
+        }
 
         let app_id = std::env::var("APP_ID").unwrap_or_default();
         if app_id.is_empty() {
@@ -110,7 +122,7 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string()),
             scopes: non_empty(std::env::var("SCOPES").ok())
                 .unwrap_or_else(|| DEFAULT_SCOPES.to_string()),
-            env_path,
+            env_path: env_path.to_path_buf(),
             token_store_path: PathBuf::from(TOKEN_STORE_FILE),
         })
     }
@@ -181,9 +193,33 @@ fn restrict_to_owner(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Render a value for a `KEY=value` line, double-quoting it (and escaping `"` and `\`) when it
+/// contains whitespace or a character that would otherwise change the line's meaning.
+fn render_env_value(value: &str) -> String {
+    let needs_quoting = value.is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '#' | '"' | '\''));
+    if !needs_quoting {
+        return value.to_string();
+    }
+
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 /// Set `key=value` in `path`, replacing an existing assignment or appending a
 /// new one. Comments and unrelated lines are left untouched.
 fn upsert_env_var(path: &Path, key: &str, value: &str) -> Result<()> {
+    let rendered = render_env_value(value);
     let existing = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -198,7 +234,7 @@ fn upsert_env_var(path: &Path, key: &str, value: &str) -> Result<()> {
         let trimmed = line.trim_start();
         if !replaced && (trimmed.starts_with(&prefix) || trimmed == key) {
             out.push_str(&prefix);
-            out.push_str(value);
+            out.push_str(&rendered);
             out.push('\n');
             replaced = true;
         } else {
@@ -209,7 +245,7 @@ fn upsert_env_var(path: &Path, key: &str, value: &str) -> Result<()> {
 
     if !replaced {
         out.push_str(&prefix);
-        out.push_str(value);
+        out.push_str(&rendered);
         out.push('\n');
     }
 
@@ -221,6 +257,10 @@ fn upsert_env_var(path: &Path, key: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
+
+    /// Serializes tests that read or mutate process environment variables.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -228,6 +268,17 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("donationalerts-test-{nanos}-{name}"))
+    }
+
+    fn save_env(key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+
+    fn restore_env(key: &str, prev: Option<String>) {
+        match prev {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]
@@ -342,5 +393,116 @@ mod tests {
 
         let _ = fs::remove_file(&env);
         let _ = fs::remove_file(&store);
+    }
+
+    #[test]
+    fn env_only_key_falls_back_to_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_app = save_env("APP_ID");
+        let prev_redirect = save_env("REDIRECT_URI");
+        std::env::set_var("APP_ID", "env-app");
+        std::env::set_var("REDIRECT_URI", "https://fallback.example/");
+
+        let env_file = temp_path(".env-fallback");
+        fs::write(&env_file, "# nothing the CLI manages here\n").unwrap();
+
+        let config = Config::load_from(&env_file).unwrap();
+        assert_eq!(
+            config.app_id, "env-app",
+            "environment APP_ID should be used"
+        );
+        assert_eq!(
+            config.redirect_uri, "https://fallback.example/",
+            "environment REDIRECT_URI should be used when .env omits it"
+        );
+
+        let _ = fs::remove_file(&env_file);
+        restore_env("APP_ID", prev_app);
+        restore_env("REDIRECT_URI", prev_redirect);
+    }
+
+    #[test]
+    fn dotenv_overrides_exported_variables() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_app = save_env("APP_ID");
+        let prev_token = save_env("ACCESS_TOKEN");
+        std::env::set_var("APP_ID", "env-app");
+        std::env::set_var("ACCESS_TOKEN", "old-exported-token");
+
+        let env_file = temp_path(".env-override");
+        fs::write(
+            &env_file,
+            "APP_ID=file-app\nACCESS_TOKEN=new-stored-token\n",
+        )
+        .unwrap();
+
+        let config = Config::load_from(&env_file).unwrap();
+        assert_eq!(config.app_id, "file-app", ".env APP_ID should win");
+        assert_eq!(
+            config.access_token.as_deref(),
+            Some("new-stored-token"),
+            ".env ACCESS_TOKEN should win over the exported value"
+        );
+
+        let _ = fs::remove_file(&env_file);
+        restore_env("APP_ID", prev_app);
+        restore_env("ACCESS_TOKEN", prev_token);
+    }
+
+    #[test]
+    fn malformed_env_is_an_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let env_file = temp_path(".env-malformed");
+        fs::write(&env_file, "TEST_KEY=1\nSCOPES=a b c\n").unwrap();
+
+        let err = match Config::load_from(&env_file) {
+            Ok(_) => panic!("a malformed .env should not load"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains(".env"),
+            "error should name the file: {err}"
+        );
+
+        let _ = fs::remove_file(&env_file);
+        std::env::remove_var("TEST_KEY");
+    }
+
+    #[test]
+    fn missing_env_falls_back_to_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_app = save_env("APP_ID");
+        std::env::set_var("APP_ID", "env-only-app");
+
+        let missing = temp_path(".env-does-not-exist");
+        let config = Config::load_from(&missing).unwrap();
+        assert_eq!(config.app_id, "env-only-app");
+
+        restore_env("APP_ID", prev_app);
+    }
+
+    #[test]
+    fn spaced_value_round_trips_through_writer() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_app = save_env("APP_ID");
+        let prev_scopes = save_env("SCOPES");
+        std::env::set_var("APP_ID", "x");
+
+        let env_file = temp_path(".env-writer");
+        upsert_env_var(
+            &env_file,
+            "SCOPES",
+            "oauth-user-show oauth-donation-subscribe",
+        )
+        .unwrap();
+        let config = Config::load_from(&env_file).unwrap();
+        assert_eq!(config.scopes, "oauth-user-show oauth-donation-subscribe");
+        assert!(fs::read_to_string(&env_file)
+            .unwrap()
+            .contains("SCOPES=\"oauth-user-show oauth-donation-subscribe\""));
+
+        let _ = fs::remove_file(&env_file);
+        restore_env("APP_ID", prev_app);
+        restore_env("SCOPES", prev_scopes);
     }
 }
