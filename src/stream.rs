@@ -222,10 +222,10 @@ async fn drain(ws: &mut Ws) -> Result<()> {
     }
 }
 
-/// Why a push frame did not yield a usable donation.
+/// Why a gateway frame did not yield a usable donation.
 #[derive(Debug, PartialEq)]
 enum PayloadError {
-    /// A push object with no payload under `pub.data` or directly on the push.
+    /// A publication frame carried no recognizable donation payload.
     Missing,
     /// A payload carried as a string that is not valid JSON.
     Undecodable(String),
@@ -233,25 +233,63 @@ enum PayloadError {
 
 /// Locate the donation carried by a gateway frame.
 ///
-/// The gateway wraps a publication under `pub`, so the payload lives at
-/// `push.pub.data`; the older flat `push.data` shape is accepted as a fallback.
-/// `Ok(None)` means the frame is not a push (a command reply or keepalive) and
-/// `Err(_)` means a push was received whose payload could not be read.
+/// DonationAlerts wraps every server push in a top-level `result` object
+/// (Centrifugo 2.x), so a donation lives at `result.data.data`, as in
+/// `{"result":{"type":1,"channel":"...","data":{"seq":N,"data":{...}}}}`.
+/// The raw Centrifugo shapes (`push.pub.data`, then `push.data`) are accepted
+/// as a fallback. `Ok(None)` means the frame is not a donation publication (a
+/// command reply, the subscription notice, or a keepalive) and `Err(_)` means a
+/// publication was received whose payload could not be read.
 fn extract_donation(frame: &Value) -> Result<Option<Value>, PayloadError> {
-    let Some(push) = frame.get("push") else {
+    // Command replies (and only replies) carry an `id`; everything else is a
+    // server push.
+    if frame.get("id").is_some() {
+        return Ok(None);
+    }
+    if let Some(result) = frame.get("result") {
+        return extract_from_result(result);
+    }
+    if let Some(push) = frame.get("push") {
+        return extract_from_push(push);
+    }
+    Ok(None)
+}
+
+/// Read the donation from a DonationAlerts `result`-wrapped push.
+///
+/// The publication payload is nested one level deep at `result.data.data`.
+/// A `result.data` object without a `data` member is the subscription notice
+/// (it carries `info`) or another non-donation push, and yields `Ok(None)`.
+fn extract_from_result(result: &Value) -> Result<Option<Value>, PayloadError> {
+    let Some(publication) = result.get("data").and_then(Value::as_object) else {
         return Ok(None);
     };
+    let Some(payload) = publication.get("data") else {
+        return Ok(None);
+    };
+    match payload {
+        Value::Object(_) => Ok(Some(payload.clone())),
+        Value::String(encoded) => decode_payload_string(encoded).map(Some),
+        _ => Err(PayloadError::Missing),
+    }
+}
+
+/// Read the donation from a raw Centrifugo `push` frame.
+fn extract_from_push(push: &Value) -> Result<Option<Value>, PayloadError> {
     let payload = push
         .get("pub")
         .and_then(|publication| publication.get("data"))
         .or_else(|| push.get("data"))
         .ok_or(PayloadError::Missing)?;
     match payload {
-        Value::String(encoded) => serde_json::from_str(encoded)
-            .map(Some)
-            .map_err(|e| PayloadError::Undecodable(e.to_string())),
+        Value::String(encoded) => decode_payload_string(encoded).map(Some),
         value => Ok(Some(value.clone())),
     }
+}
+
+/// Decode a JSON-encoded payload string into a value.
+fn decode_payload_string(encoded: &str) -> Result<Value, PayloadError> {
+    serde_json::from_str(encoded).map_err(|e| PayloadError::Undecodable(e.to_string()))
 }
 
 /// Print the donation carried by a push frame; ignore everything else.
@@ -269,10 +307,11 @@ fn handle_text(raw: &str) {
             Ok(line) => println!("{line}"),
             Err(e) => eprintln!("could not serialize donation: {e}"),
         },
-        Ok(None) => {} // command reply or keepalive
+        Ok(None) => {} // command reply, subscription notice, or keepalive
         Err(PayloadError::Missing) => {
             eprintln!(
-                "unrecognized push frame (no payload under push.pub.data or push.data): {raw}"
+                "unrecognized push frame (no donation under result.data.data, \
+                 push.pub.data, or push.data): {raw}"
             );
         }
         Err(PayloadError::Undecodable(e)) => {
@@ -316,6 +355,83 @@ mod tests {
 
         let transport = anyhow!("connection reset");
         assert!(transport.downcast_ref::<AuthFailure>().is_none());
+    }
+
+    #[test]
+    fn donation_under_the_result_envelope_is_extracted() {
+        // Captured from the live DonationAlerts gateway (Centrifugo 2.5.1):
+        // pushes are wrapped in a top-level `result`, donation at `result.data.data`.
+        let frame = json!({
+            "result": {
+                "type": 1,
+                "channel": "$alerts:donation_5116810",
+                "data": {
+                    "seq": 227,
+                    "data": {
+                        "id": 189804356,
+                        "name": "Donations",
+                        "username": "test",
+                        "message": "test",
+                        "amount": 555,
+                        "currency": "RUB",
+                        "recipient_name": "gunlinux",
+                        "recipient": { "user_id": 5116810 },
+                        "created_at": "2026-08-26 07:33:34"
+                    }
+                }
+            }
+        });
+        let donation = extract_donation(&frame).unwrap().unwrap();
+        assert_eq!(donation["id"], 189804356);
+        assert_eq!(donation["amount"], 555);
+        assert_eq!(donation["recipient"]["user_id"], 5116810);
+    }
+
+    #[test]
+    fn subscription_notice_under_the_result_envelope_is_ignored() {
+        // The gateway pushes this on the channel right after subscribing; it
+        // must be ignored without a diagnostic.
+        let frame = json!({
+            "result": {
+                "type": 1,
+                "channel": "$alerts:donation_5116810",
+                "data": { "info": { "user": "Client:21819", "client": "abc-123" } }
+            }
+        });
+        assert_eq!(extract_donation(&frame), Ok(None));
+    }
+
+    #[test]
+    fn result_wrapped_payload_delivered_as_an_encoded_string_is_decoded() {
+        let frame = json!({
+            "result": {
+                "channel": "$alerts:donation_1",
+                "data": { "seq": 1, "data": "{\"id\":7,\"amount\":9}" }
+            }
+        });
+        let donation = extract_donation(&frame).unwrap().unwrap();
+        assert_eq!(donation["id"], 7);
+        assert_eq!(donation["amount"], 9);
+    }
+
+    #[test]
+    fn result_wrapped_publication_with_an_unusable_payload_is_reported() {
+        let frame = json!({
+            "result": {
+                "channel": "$alerts:donation_1",
+                "data": { "seq": 1, "data": 5 }
+            }
+        });
+        assert_eq!(extract_donation(&frame), Err(PayloadError::Missing));
+    }
+
+    #[test]
+    fn command_reply_with_an_id_is_ignored() {
+        let frame = json!({
+            "id": 2,
+            "result": { "recoverable": true, "seq": 12, "epoch": "1787823005" }
+        });
+        assert_eq!(extract_donation(&frame), Ok(None));
     }
 
     #[test]

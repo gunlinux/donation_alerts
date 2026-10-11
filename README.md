@@ -50,8 +50,12 @@ impossible it exits with a message telling you to re-run `token <CODE>`.
 `listen` reconnects on its own (5s backoff) and keeps the websocket alive with
 a periodic ping.
 
-Each donation is read from the gateway's `push.pub.data` envelope (falling back
-to a flat `push.data`, and accepting a JSON-encoded string). A push frame whose
-payload cannot be read is reported on stderr instead of being dropped silently,
-so a payload-shape mismatch shows up in the log rather than looking like an idle
-subscription.
+DonationAlerts wraps every server push in a top-level `result` object
+(Centrifugo 2.x), so each donation is read from `result.data.data`, for example
+`{"result":{"type":1,"channel":"$alerts:donation_<id>","data":{"seq":N,"data":{…}}}}`.
+The raw Centrifugo shapes (`push.pub.data`, then a flat `push.data`, and a
+JSON-encoded string) are accepted as a fallback. The subscription notice the
+gateway pushes right after subscribing carries `result.data.info` and is ignored.
+A publication whose payload cannot be read is reported on stderr instead of being
+dropped silently, so a payload-shape mismatch shows up in the log rather than
+looking like an idle subscription.
