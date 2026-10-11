@@ -29,6 +29,9 @@ enum Command {
         /// The `code` query parameter from the redirect URL.
         code: String,
     },
+    /// Renew the access token using the stored refresh token.
+    #[command(alias = "renew")]
+    Refresh,
     /// Connect to DonationAlerts and print incoming donations as JSON lines.
     #[command(alias = "run")]
     Listen,
@@ -47,9 +50,13 @@ async fn main() -> Result<()> {
             let config = config::Config::load()?;
             auth::exchange_and_store(&config, &code).await?;
         }
+        Command::Refresh => {
+            let mut config = config::Config::load()?;
+            auth::refresh_and_store(&mut config).await?;
+        }
         Command::Listen => {
-            let config = config::Config::load()?;
-            stream::listen(&config).await?;
+            let mut config = config::Config::load()?;
+            stream::listen(&mut config).await?;
         }
     }
 

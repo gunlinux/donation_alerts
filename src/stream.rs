@@ -8,6 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::auth;
 use crate::config::{Config, API_BASE, WS_URL};
 
 type Ws =
@@ -16,22 +17,69 @@ type Ws =
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Connect and print donations, reconnecting forever on any failure.
-pub async fn listen(config: &Config) -> Result<()> {
-    let access_token = config
-        .access_token
-        .as_deref()
-        .context("ACCESS_TOKEN is not set in .env — run `donationalerts token <CODE>` first")?;
+/// An access token was rejected (HTTP 401). Distinct from transport errors so
+/// the listener can refresh once and then give up instead of looping.
+#[derive(Debug)]
+struct AuthFailure(String);
+
+impl std::fmt::Display for AuthFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for AuthFailure {}
+
+/// Connect and print donations, reconnecting on transport failures. Renews the
+/// access token before connecting when it is due, and once more if the gateway
+/// rejects it, exiting with guidance when renewal is impossible.
+pub async fn listen(config: &mut Config) -> Result<()> {
     let user_id = config
         .user_id
         .as_deref()
-        .context("USER_ID is not set (put it in .env or the environment)")?;
+        .context("USER_ID is not set (put it in .env or the environment)")?
+        .to_string();
     let channel = format!("$alerts:donation_{user_id}");
 
+    if config.needs_refresh()? {
+        match auth::refresh_and_store(config).await {
+            Ok(()) => eprintln!("access token refreshed before connecting"),
+            Err(e) => {
+                eprintln!("could not refresh access token: {e:#}; using the stored token")
+            }
+        }
+    }
+
+    let mut refreshed_since_connect = false;
     loop {
-        match run_once(access_token, &channel).await {
-            Ok(()) => eprintln!("connection closed by the gateway; reconnecting"),
-            Err(e) => eprintln!("stream error: {e:#}; reconnecting"),
+        let access_token = config
+            .access_token
+            .clone()
+            .context("ACCESS_TOKEN is not set in .env — run `donationalerts token <CODE>` first")?;
+
+        match run_once(&access_token, &channel).await {
+            Ok(()) => {
+                refreshed_since_connect = false;
+                eprintln!("connection closed by the gateway; reconnecting");
+            }
+            Err(e) if e.downcast_ref::<AuthFailure>().is_some() => {
+                if refreshed_since_connect {
+                    return Err(anyhow!(
+                        "access token is still rejected after refreshing: {e:#}. \
+                         Re-run `donationalerts token <CODE>`"
+                    ));
+                }
+                eprintln!("access token rejected; attempting to refresh: {e:#}");
+                auth::refresh_and_store(config)
+                    .await
+                    .context("refreshing the rejected access token")?;
+                refreshed_since_connect = true;
+                continue;
+            }
+            Err(e) => {
+                refreshed_since_connect = false;
+                eprintln!("stream error: {e:#}; reconnecting");
+            }
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }
@@ -68,6 +116,11 @@ async fn fetch_connection_token(http: &reqwest::Client, access_token: &str) -> R
         .json()
         .await
         .context("decoding the connection token response")?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(anyhow::Error::new(AuthFailure(format!(
+            "user/oauth rejected the access token (HTTP 401): {payload}"
+        ))));
+    }
     if !status.is_success() {
         bail!("user/oauth failed: HTTP {status}: {payload}");
     }
@@ -117,6 +170,11 @@ async fn create_subscription(
         .json()
         .await
         .context("decoding the subscription token response")?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(anyhow::Error::new(AuthFailure(format!(
+            "centrifuge/subscribe rejected the access token (HTTP 401): {payload}"
+        ))));
+    }
     if !status.is_success() {
         bail!("centrifuge/subscribe failed: HTTP {status}: {payload}");
     }
@@ -216,5 +274,19 @@ fn check_error(frame: &Value) -> Result<()> {
     match frame.get("error") {
         Some(error) => Err(anyhow!("gateway error: {error}")),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_failure_is_distinguishable_from_other_errors() {
+        let auth = anyhow::Error::new(AuthFailure("401".into()));
+        assert!(auth.downcast_ref::<AuthFailure>().is_some());
+
+        let transport = anyhow!("connection reset");
+        assert!(transport.downcast_ref::<AuthFailure>().is_none());
     }
 }
