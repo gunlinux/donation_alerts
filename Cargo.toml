@@ -1,0 +1,20 @@
+[package]
+name = "donation-alerts"
+version = "0.1.0"
+edition = "2021"
+description = "DonationAlerts consumer: OAuth helper and a live donation printer"
+
+[[bin]]
+name = "donationalerts"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
