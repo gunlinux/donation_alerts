@@ -222,6 +222,38 @@ async fn drain(ws: &mut Ws) -> Result<()> {
     }
 }
 
+/// Why a push frame did not yield a usable donation.
+#[derive(Debug, PartialEq)]
+enum PayloadError {
+    /// A push object with no payload under `pub.data` or directly on the push.
+    Missing,
+    /// A payload carried as a string that is not valid JSON.
+    Undecodable(String),
+}
+
+/// Locate the donation carried by a gateway frame.
+///
+/// The gateway wraps a publication under `pub`, so the payload lives at
+/// `push.pub.data`; the older flat `push.data` shape is accepted as a fallback.
+/// `Ok(None)` means the frame is not a push (a command reply or keepalive) and
+/// `Err(_)` means a push was received whose payload could not be read.
+fn extract_donation(frame: &Value) -> Result<Option<Value>, PayloadError> {
+    let Some(push) = frame.get("push") else {
+        return Ok(None);
+    };
+    let payload = push
+        .get("pub")
+        .and_then(|publication| publication.get("data"))
+        .or_else(|| push.get("data"))
+        .ok_or(PayloadError::Missing)?;
+    match payload {
+        Value::String(encoded) => serde_json::from_str(encoded)
+            .map(Some)
+            .map_err(|e| PayloadError::Undecodable(e.to_string())),
+        value => Ok(Some(value.clone())),
+    }
+}
+
 /// Print the donation carried by a push frame; ignore everything else.
 fn handle_text(raw: &str) {
     let frame: Value = match serde_json::from_str(raw) {
@@ -232,24 +264,20 @@ fn handle_text(raw: &str) {
         }
     };
 
-    let Some(push) = frame.get("push") else {
-        return; // command reply or keepalive
-    };
-    let data = match push.get("data") {
-        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
-            Ok(value) => value,
-            Err(e) => {
-                eprintln!("could not parse donation payload: {e}");
-                return;
-            }
+    match extract_donation(&frame) {
+        Ok(Some(donation)) => match serde_json::to_string(&donation) {
+            Ok(line) => println!("{line}"),
+            Err(e) => eprintln!("could not serialize donation: {e}"),
         },
-        Some(value) => value.clone(),
-        None => return,
-    };
-
-    match serde_json::to_string(&data) {
-        Ok(line) => println!("{line}"),
-        Err(e) => eprintln!("could not serialize donation: {e}"),
+        Ok(None) => {} // command reply or keepalive
+        Err(PayloadError::Missing) => {
+            eprintln!(
+                "unrecognized push frame (no payload under push.pub.data or push.data): {raw}"
+            );
+        }
+        Err(PayloadError::Undecodable(e)) => {
+            eprintln!("could not parse donation payload: {e}");
+        }
     }
 }
 
@@ -288,5 +316,59 @@ mod tests {
 
         let transport = anyhow!("connection reset");
         assert!(transport.downcast_ref::<AuthFailure>().is_none());
+    }
+
+    #[test]
+    fn donation_nested_under_the_pub_envelope_is_extracted() {
+        let frame = json!({
+            "push": {
+                "channel": "$alerts:donation_1",
+                "pub": { "data": { "id": 1, "username": "alice", "amount": 100 } }
+            }
+        });
+        let donation = extract_donation(&frame).unwrap().unwrap();
+        assert_eq!(donation["username"], "alice");
+        assert_eq!(donation["amount"], 100);
+    }
+
+    #[test]
+    fn donation_carried_directly_on_the_push_is_extracted() {
+        let frame = json!({
+            "push": { "channel": "$alerts:donation_1", "data": { "id": 2 } }
+        });
+        let donation = extract_donation(&frame).unwrap().unwrap();
+        assert_eq!(donation["id"], 2);
+    }
+
+    #[test]
+    fn string_encoded_payload_is_decoded() {
+        let frame = json!({
+            "push": { "channel": "$alerts:donation_1", "pub": { "data": "{\"id\":3,\"amount\":50}" } }
+        });
+        let donation = extract_donation(&frame).unwrap().unwrap();
+        assert_eq!(donation["amount"], 50);
+    }
+
+    #[test]
+    fn push_without_a_payload_is_reported_not_silently_dropped() {
+        let frame = json!({
+            "push": { "channel": "$alerts:donation_1", "info": {} }
+        });
+        assert_eq!(extract_donation(&frame), Err(PayloadError::Missing));
+    }
+
+    #[test]
+    fn non_push_frame_is_ignored_silently() {
+        let frame = json!({ "id": 2, "result": { "channel": "$alerts:donation_1" } });
+        assert_eq!(extract_donation(&frame), Ok(None));
+    }
+
+    #[test]
+    fn undecodable_payload_is_reported() {
+        let frame = json!({ "push": { "pub": { "data": "not json" } } });
+        assert!(matches!(
+            extract_donation(&frame),
+            Err(PayloadError::Undecodable(_))
+        ));
     }
 }

@@ -49,3 +49,9 @@ impossible it exits with a message telling you to re-run `token <CODE>`.
 
 `listen` reconnects on its own (5s backoff) and keeps the websocket alive with
 a periodic ping.
+
+Each donation is read from the gateway's `push.pub.data` envelope (falling back
+to a flat `push.data`, and accepting a JSON-encoded string). A push frame whose
+payload cannot be read is reported on stderr instead of being dropped silently,
+so a payload-shape mismatch shows up in the log rather than looking like an idle
+subscription.
