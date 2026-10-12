@@ -2,6 +2,7 @@
 
 mod auth;
 mod config;
+mod publish;
 mod stream;
 
 use anyhow::Result;

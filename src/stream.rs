@@ -1,6 +1,7 @@
 //! Live donation stream: Centrifugo WebSocket handshake, channel
 //! subscription, and printing of incoming donation pushes.
 
+use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -9,7 +10,8 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::auth;
-use crate::config::{Config, API_BASE, WS_URL};
+use crate::config::{self, Config, API_BASE, WS_URL};
+use crate::publish::{self, Publisher};
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -34,6 +36,14 @@ impl std::error::Error for AuthFailure {}
 /// access token before connecting when it is due, and once more if the gateway
 /// rejects it, exiting with guidance when renewal is impossible.
 pub async fn listen(config: &mut Config) -> Result<()> {
+    // Listening always publishes, so a missing broker address panics here,
+    // before any gateway connection is attempted.
+    let dsn = config::require_dsn(config.rabbit_mq_dsn.clone());
+    let mut publisher = publish::RabbitPublisher::new(dsn);
+    if let Err(e) = publisher.preflight().await {
+        eprintln!("could not connect to RabbitMQ: {e:#}; will retry on each donation");
+    }
+
     let user_id = config
         .user_id
         .as_deref()
@@ -57,7 +67,7 @@ pub async fn listen(config: &mut Config) -> Result<()> {
             .clone()
             .context("ACCESS_TOKEN is not set in .env — run `donationalerts token <CODE>` first")?;
 
-        match run_once(&access_token, &channel).await {
+        match run_once(&access_token, &channel, &mut publisher).await {
             Ok(()) => {
                 refreshed_since_connect = false;
                 eprintln!("connection closed by the gateway; reconnecting");
@@ -85,7 +95,11 @@ pub async fn listen(config: &mut Config) -> Result<()> {
     }
 }
 
-async fn run_once(access_token: &str, channel: &str) -> Result<()> {
+async fn run_once<P: Publisher>(
+    access_token: &str,
+    channel: &str,
+    publisher: &mut P,
+) -> Result<()> {
     let http = reqwest::Client::new();
 
     let connection_token = fetch_connection_token(&http, access_token).await?;
@@ -99,7 +113,7 @@ async fn run_once(access_token: &str, channel: &str) -> Result<()> {
     subscribe(&mut ws, channel, &subscription_token).await?;
 
     eprintln!("subscribed to {channel}; waiting for donations");
-    drain(&mut ws).await
+    drain(&mut ws, publisher).await
 }
 
 /// GET the socket connection token for the authorized user.
@@ -199,8 +213,8 @@ async fn subscribe(ws: &mut Ws, channel: &str, token: &str) -> Result<()> {
     check_error(&reply)
 }
 
-/// Read frames until the connection closes, printing each donation.
-async fn drain(ws: &mut Ws) -> Result<()> {
+/// Read frames until the connection closes, printing and publishing each donation.
+async fn drain<P: Publisher>(ws: &mut Ws, publisher: &mut P) -> Result<()> {
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await; // consume the immediate first tick
 
@@ -213,7 +227,9 @@ async fn drain(ws: &mut Ws) -> Result<()> {
                 match message {
                     None => return Ok(()),
                     Some(Err(e)) => return Err(e).context("websocket receive failed"),
-                    Some(Ok(Message::Text(text))) => handle_text(text.as_str()),
+                    Some(Ok(Message::Text(text))) => {
+                        handle_frame(text.as_str(), publisher, &mut std::io::stdout()).await;
+                    }
                     Some(Ok(Message::Close(_))) => return Ok(()),
                     Some(Ok(_)) => {}
                 }
@@ -292,8 +308,11 @@ fn decode_payload_string(encoded: &str) -> Result<Value, PayloadError> {
     serde_json::from_str(encoded).map_err(|e| PayloadError::Undecodable(e.to_string()))
 }
 
-/// Print the donation carried by a push frame; ignore everything else.
-fn handle_text(raw: &str) {
+/// Print and publish the donation carried by a push frame; ignore everything else.
+///
+/// `out` receives the donation JSON line (standard output in the listener);
+/// the same bytes are published to RabbitMQ.
+async fn handle_frame<P: Publisher, W: Write>(raw: &str, publisher: &mut P, out: &mut W) {
     let frame: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(e) => {
@@ -303,8 +322,13 @@ fn handle_text(raw: &str) {
     };
 
     match extract_donation(&frame) {
-        Ok(Some(donation)) => match serde_json::to_string(&donation) {
-            Ok(line) => println!("{line}"),
+        Ok(Some(donation)) => match publish::message_body(&donation) {
+            Ok(body) => {
+                if let Err(e) = out.write_all(&body).and_then(|_| out.write_all(b"\n")) {
+                    eprintln!("could not write donation to stdout: {e}");
+                }
+                publish::publish_with_retry(publisher, &body).await;
+            }
             Err(e) => eprintln!("could not serialize donation: {e}"),
         },
         Ok(None) => {} // command reply, subscription notice, or keepalive
@@ -486,5 +510,91 @@ mod tests {
             extract_donation(&frame),
             Err(PayloadError::Undecodable(_))
         ));
+    }
+
+    /// Records every published body so the listener can be exercised without a
+    /// live broker.
+    #[derive(Default)]
+    struct RecordingPublisher {
+        calls: Vec<Vec<u8>>,
+    }
+
+    impl Publisher for RecordingPublisher {
+        async fn publish(&mut self, body: &[u8]) -> Result<()> {
+            self.calls.push(body.to_vec());
+            Ok(())
+        }
+    }
+
+    struct FailingPublisher;
+
+    impl Publisher for FailingPublisher {
+        async fn publish(&mut self, _body: &[u8]) -> Result<()> {
+            Err(anyhow::anyhow!("broker down"))
+        }
+    }
+
+    #[tokio::test]
+    async fn donation_frame_is_published_and_printed() {
+        let raw = r#"{"result":{"type":1,"channel":"$alerts:donation_5116810",
+            "data":{"seq":227,"data":{"id":7,"name":null,"message":"","amount":9}}}}"#;
+        let mut publisher = RecordingPublisher::default();
+        let mut out: Vec<u8> = Vec::new();
+        handle_frame(raw, &mut publisher, &mut out).await;
+
+        assert_eq!(publisher.calls.len(), 1, "exactly one publish");
+        let body: Value = serde_json::from_slice(&publisher.calls[0]).unwrap();
+        assert_eq!(body["id"], 7);
+        assert!(body["name"].is_null());
+        assert_eq!(body["message"], "");
+
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.ends_with('\n'),
+            "stdout line must end with a newline"
+        );
+        let printed_value: Value = serde_json::from_str(printed.trim_end()).unwrap();
+        assert_eq!(
+            printed_value, body,
+            "stdout must carry the same donation as the publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_donation_frames_publish_nothing() {
+        let frames = [
+            // command reply
+            r#"{"id":2,"result":{"recoverable":true,"seq":12}}"#,
+            // subscription notice
+            r#"{"result":{"type":1,"channel":"$alerts:donation_1","data":{"info":{"user":"Client:1"}}}}"#,
+            // undecodable publication payload
+            r#"{"push":{"channel":"$alerts:donation_1","pub":{"data":"not json"}}}"#,
+        ];
+        let mut publisher = RecordingPublisher::default();
+        let mut out: Vec<u8> = Vec::new();
+        for raw in frames {
+            handle_frame(raw, &mut publisher, &mut out).await;
+        }
+        assert_eq!(
+            publisher.calls.len(),
+            0,
+            "no non-donation frame may publish"
+        );
+        assert!(out.is_empty(), "no non-donation frame may print");
+    }
+
+    #[tokio::test]
+    async fn a_publish_failure_does_not_stop_processing() {
+        let mut publisher = FailingPublisher;
+        let mut out: Vec<u8> = Vec::new();
+        let first = r#"{"result":{"channel":"c","data":{"seq":1,"data":{"id":1}}}}"#;
+        let second = r#"{"result":{"channel":"c","data":{"seq":2,"data":{"id":2}}}}"#;
+        handle_frame(first, &mut publisher, &mut out).await;
+        handle_frame(second, &mut publisher, &mut out).await;
+        assert_eq!(
+            out.iter().filter(|b| **b == b'\n').count(),
+            2,
+            "both donations were still printed after a publish failure"
+        );
     }
 }

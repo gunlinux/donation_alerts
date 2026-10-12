@@ -84,6 +84,7 @@ pub struct Config {
     pub client_secret: Option<String>,
     pub user_id: Option<String>,
     pub access_token: Option<String>,
+    pub rabbit_mq_dsn: Option<String>,
     pub redirect_uri: String,
     pub scopes: String,
     env_path: PathBuf,
@@ -118,6 +119,7 @@ impl Config {
             client_secret: non_empty(std::env::var("CLIENT_SECRET").ok()),
             user_id: non_empty(std::env::var("USER_ID").ok()),
             access_token: non_empty(std::env::var("ACCESS_TOKEN").ok()),
+            rabbit_mq_dsn: non_empty(std::env::var("RABBIT_MQ_DSN").ok()),
             redirect_uri: non_empty(std::env::var("REDIRECT_URI").ok())
                 .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string()),
             scopes: non_empty(std::env::var("SCOPES").ok())
@@ -159,6 +161,17 @@ impl Config {
 
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.trim().is_empty())
+}
+
+/// The RabbitMQ DSN, panicking when it is missing or empty.
+///
+/// Listening always publishes, so a missing broker address is a configuration
+/// error that must stop the run before it connects to the gateway.
+pub fn require_dsn(dsn: Option<String>) -> String {
+    match dsn {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => panic!("RABBIT_MQ_DSN is not set (put it in .env or the environment)"),
+    }
 }
 
 /// Load a `TokenSet` from the secrets file; `None` when the file is absent.
@@ -447,6 +460,83 @@ mod tests {
         let _ = fs::remove_file(&env_file);
         restore_env("APP_ID", prev_app);
         restore_env("ACCESS_TOKEN", prev_token);
+    }
+
+    #[test]
+    fn rabbit_dsn_follows_env_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_app = save_env("APP_ID");
+        let prev_dsn = save_env("RABBIT_MQ_DSN");
+        std::env::set_var("APP_ID", "x");
+        std::env::set_var("RABBIT_MQ_DSN", "amqp://env-host");
+
+        let env_file = temp_path(".env-rabbit");
+        fs::write(&env_file, "RABBIT_MQ_DSN=amqp://file-host\n").unwrap();
+
+        let config = Config::load_from(&env_file).unwrap();
+        assert_eq!(
+            config.rabbit_mq_dsn.as_deref(),
+            Some("amqp://file-host"),
+            ".env RABBIT_MQ_DSN should win over the exported value"
+        );
+
+        let _ = fs::remove_file(&env_file);
+        restore_env("APP_ID", prev_app);
+        restore_env("RABBIT_MQ_DSN", prev_dsn);
+    }
+
+    #[test]
+    fn rabbit_dsn_unset_is_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_app = save_env("APP_ID");
+        let prev_dsn = save_env("RABBIT_MQ_DSN");
+        std::env::set_var("APP_ID", "x");
+        std::env::remove_var("RABBIT_MQ_DSN");
+
+        let env_file = temp_path(".env-no-rabbit");
+        fs::write(&env_file, "# nothing\n").unwrap();
+
+        let config = Config::load_from(&env_file).unwrap();
+        assert_eq!(config.rabbit_mq_dsn, None);
+
+        let _ = fs::remove_file(&env_file);
+        restore_env("APP_ID", prev_app);
+        restore_env("RABBIT_MQ_DSN", prev_dsn);
+    }
+
+    #[test]
+    fn env_example_parses() {
+        // Parsed without mutating the process environment, so this only checks
+        // that the shipped example is well-formed.
+        let pairs: Vec<_> = dotenvy::from_path_iter(Path::new(".env.example"))
+            .expect(".env.example must parse")
+            .map(|entry| entry.expect("each line must parse"))
+            .collect();
+        assert!(
+            pairs.iter().any(|(k, _)| k == "APP_ID"),
+            "the example should still define the OAuth keys"
+        );
+        assert!(
+            !pairs.iter().any(|(k, _)| k == "RABBIT_MQ_DSN"),
+            "RABBIT_MQ_DSN is commented out in the example"
+        );
+    }
+
+    #[test]
+    fn require_dsn_passes_a_present_value_through() {
+        assert_eq!(require_dsn(Some("amqp://host".to_string())), "amqp://host");
+    }
+
+    #[test]
+    #[should_panic(expected = "RABBIT_MQ_DSN")]
+    fn require_dsn_panics_when_unset() {
+        require_dsn(None);
+    }
+
+    #[test]
+    #[should_panic(expected = "RABBIT_MQ_DSN")]
+    fn require_dsn_panics_when_empty() {
+        require_dsn(Some("   ".to_string()));
     }
 
     #[test]
