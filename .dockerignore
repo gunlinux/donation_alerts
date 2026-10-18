@@ -1,0 +1,11 @@
+# The build context is the repo root, but nothing outside Cargo.toml,
+# Cargo.lock and src/ is needed. Keep secrets and build output out of it.
+target
+.git
+.github
+.env
+.env.example
+.tokens.json
+openspec
+.qwen
+payload.json

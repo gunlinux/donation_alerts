@@ -74,3 +74,30 @@ gateway pushes right after subscribing carries `result.data.info` and is ignored
 A publication whose payload cannot be read is reported on stderr instead of being
 dropped silently, so a payload-shape mismatch shows up in the log rather than
 looking like an idle subscription.
+
+## Deployment
+
+CI runs on every push/PR (`.github/workflows/rust-ci.yaml`, workflow name
+`Rust`: `cargo fmt --check`, `clippy -D warnings`, `cargo test`). When it passes
+on `main`, `.github/workflows/deploy.yaml` builds the `Dockerfile` image, pushes
+it to Docker Hub as `gunlinuxloki/donation-alerts:<short-sha>` (plus `latest`),
+then runs `.github/deploy.sh` on the server over SSH, which pins
+`deploy/donation-alerts.service` to that tag and restarts the unit:
+
+```sh
+sudo systemctl status donation-alerts
+sudo journalctl -u donation-alerts -f     # the donation stream
+```
+
+The image contains no secrets: the unit mounts the checkout at
+`/home/loki/www/donation_alerts` as the container's working directory, so the
+listener reads `.env` + `.tokens.json` from the host and writes a rotated
+refresh token back. One-time setup on the server — clone the repo there, write
+`.env` (`APP_ID`, `RABBIT_MQ_DSN`, …) and obtain `.tokens.json` with
+`donationalerts token <CODE>` — then the first merge to `main` deploys itself.
+Running it locally in a container is the same image with the two files mounted:
+
+```sh
+docker build -t gunlinuxloki/donation-alerts:dev .
+docker run --rm -v "$PWD:/data" -w /data gunlinuxloki/donation-alerts:dev listen
+```

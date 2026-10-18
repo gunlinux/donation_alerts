@@ -1,0 +1,46 @@
+# donation-alerts — DonationAlerts listener, Docker image deployment.
+#
+# Runs the public Docker Hub image gunlinuxloki/donation-alerts. The
+# @IMAGE_TAG@ placeholder is substituted with the deploying commit's short SHA
+# by .github/deploy.sh at install time (sed), so the unit always pins the exact
+# deployed revision — rollback is a restart with a previous tag.
+#
+# --network host: the listener dials the local RabbitMQ broker and the
+# DonationAlerts gateway; host networking keeps `amqp://…@localhost` working
+# exactly as it does in the host .env.
+#
+# The deploy checkout is bind-mounted at /data (the image's WORKDIR), so `.env`
+# and `.tokens.json` stay on the host — and a refresh token rotated by the
+# listener is written back there, so it survives container restarts.
+# @RUN_UID@ is substituted by .github/deploy.sh with the deploying user's
+# `id -u:id -g` so those host files stay owned by (and editable by) that user.
+#
+# Env: `.env` is read from the working directory by the binary itself (dotenvy),
+# not injected with `docker --env-file` — one source of truth for the secrets.
+
+[Unit]
+Description=donation-alerts listener — docker image
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+User=loki
+Group=loki
+
+# `-` prefix: tolerated failure (container not running yet on first start).
+ExecStartPre=-/usr/bin/docker rm -f donation-alerts
+ExecStartPre=/usr/bin/docker pull gunlinuxloki/donation-alerts:@IMAGE_TAG@
+ExecStart=/usr/bin/docker run --rm --name donation-alerts \
+  --network host \
+  --user @RUN_UID@ \
+  -v /home/loki/www/donation_alerts:/data \
+  -w /data \
+  gunlinuxloki/donation-alerts:@IMAGE_TAG@ listen
+ExecStop=/usr/bin/docker stop donation-alerts
+Restart=on-failure
+RestartSec=10
+SyslogIdentifier=donation-alerts
+
+[Install]
+WantedBy=multi-user.target

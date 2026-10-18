@@ -1,0 +1,52 @@
+name: Rust
+
+# Quality gate for the donation-alerts binary. Runs on every push/PR; the
+# "Deploy to Server" workflow triggers on this workflow's success on main
+# (workflow_run), so anything merged to main that passes here ships.
+#
+# The crate has no workspace split, no web assets and no database: fmt, clippy
+# and the unit tests are the whole gate.
+
+on: [push, pull_request]
+
+jobs:
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pin to the project toolchain (1.96, matching the Dockerfile) — rustfmt
+      # output is version-sensitive and must match contributors. rustfmt/clippy
+      # are separate components the action does not install by default.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      # --all-targets so the `#[cfg(test)]` modules are linted too —
+      # the suite in src/*.rs carries a fair amount of logic.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      # No network or broker: the tests cover config/token plumbing and the
+      # publish path's serialization, and .env stays untouched (one test parses
+      # the shipped .env.example without mutating the environment).
+      - run: cargo test --locked
