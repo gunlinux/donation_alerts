@@ -70,11 +70,12 @@ sudo systemctl daemon-reload
 
 # --- 4. (Re)start the listener ------------------------------------------------
 docker pull "$IMAGE:$TAG" >/dev/null
-sudo systemctl enable "$UNIT" >/dev/null
+sudo systemctl enable --now "$UNIT" >/dev/null
 
-# `enable --now` does not restart an already-active unit; restart explicitly
-# when the running image differs from the deployed tag (idempotent no-op when
-# the tag is unchanged).
+# `enable --now` starts the unit when it is not already running (first deploy,
+# or a unit left inactive by an earlier failure) but never restarts an active
+# one; restart explicitly when the running image differs from the deployed tag
+# (idempotent no-op when the tag is unchanged).
 CURRENT="$(docker inspect --format '{{.Config.Image}}' "$UNIT" 2>/dev/null || true)"
 if [ "$CURRENT" != "$IMAGE:$TAG" ]; then
     sudo systemctl restart "$UNIT"
