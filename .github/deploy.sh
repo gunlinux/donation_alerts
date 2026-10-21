@@ -12,10 +12,10 @@
 # swap: the listener writes nothing but its own log, so the whole deploy is
 # "pull the tag, pin the unit, restart".
 #
-# Prerequisite (one-time, on the server): a git clone of this repo at
-# $REPO_DIR with a hand-written .env carrying APP_ID and RABBIT_MQ_DSN, plus a
-# .tokens.json produced by `donationalerts token <CODE>`. Both are gitignored
-# and survive `git reset --hard`.
+# Prerequisite (one-time, on the server): a hand-written .env at $REPO_DIR
+# carrying APP_ID and RABBIT_MQ_DSN, plus a .tokens.json produced by
+# `donationalerts token <CODE>`. Both are gitignored and survive
+# `git reset --hard`. The checkout itself is bootstrapped by this script.
 # =============================================================================
 set -euo pipefail
 
@@ -24,15 +24,21 @@ BRANCH="main"
 IMAGE="gunlinuxloki/donation-alerts"
 UNIT="donation-alerts"
 
-cd "$REPO_DIR" || exit 1
-
 TAG="${DEPLOY_TAG:?DEPLOY_TAG is required (commit short SHA)}"
 
-# Nothing but a container restart is needed, and `systemctl` is what exists on
-# the host; keep the unit file in sync with the checkout either way.
-git remote set-url origin git@github.com:gunlinux/donation_alerts.git
-
 # --- 1. Pull the deployed commit ----------------------------------------------
+# Bootstrap the checkout if the directory is not a clone yet (fresh host, or a
+# directory whose secrets were copied by hand). HTTPS because the repo is
+# public: no deploy key needed on the server. `reset --hard` never touches
+# untracked files, so a pre-existing .env / .tokens.json survives.
+mkdir -p "$REPO_DIR"
+cd "$REPO_DIR" || exit 1
+if [ ! -d .git ]; then
+    git init -q
+    git remote add origin https://github.com/gunlinux/donation_alerts.git
+fi
+git remote set-url origin https://github.com/gunlinux/donation_alerts.git
+
 git fetch --all
 git reset --hard "origin/$BRANCH"
 
