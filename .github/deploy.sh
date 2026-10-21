@@ -20,6 +20,7 @@
 set -euo pipefail
 
 REPO_DIR="/home/loki/www/donation_alerts"
+ORIGIN="https://github.com/gunlinux/donation_alerts.git"
 BRANCH="main"
 IMAGE="gunlinuxloki/donation-alerts"
 UNIT="donation-alerts"
@@ -33,12 +34,13 @@ TAG="${DEPLOY_TAG:?DEPLOY_TAG is required (commit short SHA)}"
 # untracked files, so a pre-existing .env / .tokens.json survives.
 mkdir -p "$REPO_DIR"
 cd "$REPO_DIR" || exit 1
-if [ ! -d .git ]; then
-    git init -q
-    git remote add origin https://github.com/gunlinux/donation_alerts.git
+[ -d .git ] || git init -q
+# Add origin when the directory was hand-initialised, repoint it otherwise.
+if git remote get-url origin >/dev/null 2>&1; then
+    git remote set-url origin "$ORIGIN"
+else
+    git remote add origin "$ORIGIN"
 fi
-git remote set-url origin https://github.com/gunlinux/donation_alerts.git
-
 git fetch --all
 git reset --hard "origin/$BRANCH"
 
