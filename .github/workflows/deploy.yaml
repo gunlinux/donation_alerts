@@ -70,6 +70,7 @@ jobs:
       - name: Deploy to server
         env:
           DEPLOY_TAG: ${{ steps.tag.outputs.sha7 }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
-          ssh -o StrictHostKeyChecking=no -p 187 "loki@gunlinux.ru" \
+          ssh -o StrictHostKeyChecking=no "$DEPLOY_HOST" \
             "DEPLOY_TAG=$DEPLOY_TAG bash -s" < .github/deploy.sh
