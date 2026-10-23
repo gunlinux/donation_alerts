@@ -1,19 +1,19 @@
 //! Publish consumed donations to RabbitMQ.
 
 use anyhow::{bail, Context, Result};
-use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, QueueDeclareOptions};
+use lapin::options::{BasicPublishOptions, ConfirmSelectOptions, ExchangeDeclareOptions};
 use lapin::types::FieldTable;
 use lapin::{
-    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, PublisherConfirm,
+    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, ExchangeKind,
+    PublisherConfirm,
 };
 use serde_json::Value;
 
-/// The durable queue consumed donations are published to.
-pub const QUEUE: &str = "donations";
+/// The durable fanout exchange consumed donations are published to.
+pub const EXCHANGE: &str = "donations";
 
-/// The routing key used on the default exchange. It equals the queue name so
-/// the default exchange routes each message straight to [`QUEUE`].
-pub const ROUTING_KEY: &str = "donations";
+/// Fanout ignores the routing key; keep it empty.
+pub const ROUTING_KEY: &str = "";
 
 /// The message body for a donation: the raw gateway JSON, re-encoded without
 /// any field remapping so empty/null and unknown fields pass through unchanged.
@@ -47,7 +47,7 @@ pub async fn publish_with_retry<P: Publisher>(publisher: &mut P, body: &[u8]) {
     }
 }
 
-/// Publishes donations to a RabbitMQ queue, (re)connecting on demand.
+/// Publishes donations to a RabbitMQ fanout, (re)connecting on demand.
 pub struct RabbitPublisher {
     dsn: String,
     connection: Option<Connection>,
@@ -72,7 +72,7 @@ impl RabbitPublisher {
         self.ensure_connected().await
     }
 
-    /// Open a connection and channel, declare the queue, and enable publisher
+    /// Open a connection and channel, declare the fanout, and enable publisher
     /// confirms — unless a live channel already exists.
     async fn ensure_connected(&mut self) -> Result<()> {
         if self.channel.is_some() {
@@ -87,16 +87,17 @@ impl RabbitPublisher {
             .await
             .context("opening a RabbitMQ channel")?;
         channel
-            .queue_declare(
-                QUEUE.into(),
-                QueueDeclareOptions {
+            .exchange_declare(
+                EXCHANGE.into(),
+                ExchangeKind::Fanout,
+                ExchangeDeclareOptions {
                     durable: true,
                     ..Default::default()
                 },
                 FieldTable::default(),
             )
             .await
-            .context("declaring the donations queue")?;
+            .context("declaring the donations fanout")?;
         channel
             .confirm_select(ConfirmSelectOptions::default())
             .await
@@ -117,7 +118,7 @@ impl RabbitPublisher {
         let channel = self.channel.as_ref().expect("channel exists after connect");
         let confirm: PublisherConfirm = channel
             .basic_publish(
-                "".into(),
+                EXCHANGE.into(),
                 ROUTING_KEY.into(),
                 BasicPublishOptions::default(),
                 body,
@@ -152,12 +153,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn queue_and_routing_key_match() {
-        assert_eq!(QUEUE, "donations");
-        assert_eq!(
-            ROUTING_KEY, QUEUE,
-            "the default-exchange routing key must match the queue name"
-        );
+    fn fanout_name_and_empty_routing_key() {
+        assert_eq!(EXCHANGE, "donations");
+        assert_eq!(ROUTING_KEY, "", "fanout ignores the routing key");
     }
 
     #[test]

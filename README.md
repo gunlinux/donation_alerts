@@ -9,7 +9,7 @@ login   -> open the URL, approve, copy ?code= from the redirect
 token   -> exchange the code, store ACCESS_TOKEN in .env
 refresh -> renew ACCESS_TOKEN from the stored refresh token
 listen  -> connect to the Centrifugo gateway; print donations as JSON lines
-           and publish each one to the durable `donations` RabbitMQ queue
+           and publish each one to the durable `donations` RabbitMQ fanout
 ```
 
 ## Configuration (`.env`)
@@ -56,14 +56,13 @@ impossible it exits with a message telling you to re-run `token <CODE>`.
 `listen` reconnects on its own (5s backoff) and keeps the websocket alive with
 a periodic ping.
 
-Each donation is published to RabbitMQ as well as printed. Messages go to the
-default exchange with the routing key `donations`, into a durable queue of the
-same name, and are marked persistent (delivery mode 2) so a broker restart does
-not lose them. The published body is the raw gateway JSON — empty or null fields
-(`name`, `message`, …) and fields the CLI does not interpret are passed through
-unchanged. The broker is declared at startup; if it is unreachable, the failure
-is reported on stderr and republishing is retried on the next donation rather
-than tearing down the stream.
+Each donation is published to RabbitMQ as well as printed. Messages go to a
+durable fanout exchange named `donations` and are marked persistent (delivery
+mode 2). Queue bindings are left to consumers. The published body is the raw
+gateway JSON — empty or null fields (`name`, `message`, …) and fields the CLI
+does not interpret are passed through unchanged. The exchange is declared at
+startup; if the broker is unreachable, the failure is reported on stderr and
+republishing is retried on the next donation rather than tearing down the stream.
 
 DonationAlerts wraps every server push in a top-level `result` object
 (Centrifugo 2.x), so each donation is read from `result.data.data`, for example
